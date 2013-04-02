@@ -12,3 +12,4 @@ pyflakes==0.6.1
 # Documentation Conversion
 
 pyandoc==0.0.1
+sphinx
