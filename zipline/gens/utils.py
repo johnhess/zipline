@@ -1,5 +1,5 @@
 #
-# Copyright 2012 Quantopian, Inc.
+# Copyright 2013 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,30 +19,7 @@ import numbers
 
 from hashlib import md5
 from datetime import datetime
-from itertools import izip_longest
-from zipline.protocol import (
-    DATASOURCE_TYPE,
-    Event
-)
-
-
-def mock_raw_event(sid, dt):
-    event = {
-        'sid': sid,
-        'dt': dt,
-        'price': 1.0,
-        'volume': 1
-    }
-    return event
-
-
-def alternate(g1, g2):
-    """Specialized version of roundrobin for just 2 generators."""
-    for e1, e2 in izip_longest(g1, g2):
-        if e1 is not None:
-            yield e1
-        if e2 is not None:
-            yield e2
+from zipline.protocol import DATASOURCE_TYPE
 
 
 def hash_args(*args, **kwargs):
@@ -55,25 +32,6 @@ def hash_args(*args, **kwargs):
     hasher = md5()
     hasher.update(combined)
     return hasher.hexdigest()
-
-
-def create_trade(sid, price, amount, datetime, source_id="test_factory"):
-
-    trade = Event()
-
-    trade.source_id = source_id
-    trade.type = DATASOURCE_TYPE.TRADE
-    trade.sid = sid
-    trade.dt = datetime
-    trade.price = price
-    trade.close = price
-    trade.open = price
-    trade.low = price * .95
-    trade.high = price * 1.05
-    trade.volume = amount
-    trade.TRANSACTION = None
-
-    return trade
 
 
 def assert_datasource_protocol(event):

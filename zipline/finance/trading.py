@@ -1,5 +1,5 @@
 #
-# Copyright 2012 Quantopian, Inc.
+# Copyright 2013 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import datetime
 from functools import wraps
 from collections import defaultdict, OrderedDict
 from delorean import Delorean
+import pandas as pd
 from pandas import DatetimeIndex
 
 from zipline.data.loader import load_market_data
@@ -114,8 +115,10 @@ class TradingEnvironment(object):
         if not load:
             load = load_market_data
 
-        self.benchmark_returns, self.treasury_curves = \
+        self.benchmark_returns, treasury_curves_map = \
             load(self.bm_symbol)
+
+        self.treasury_curves = pd.Series(treasury_curves_map)
 
         self._period_trading_days = None
         self._trading_days_series = None
@@ -150,6 +153,10 @@ class TradingEnvironment(object):
             day=test_date.day,
             tzinfo=pytz.utc
         )
+
+    def exchange_dt_in_utc(self, dt):
+        delorean = Delorean(dt, self.exchange_tz)
+        return delorean.shift(pytz.utc.zone).datetime
 
     @property
     def period_trading_days(self):
@@ -218,8 +225,7 @@ Last successful date: %s" % self.market_open)
         )
         # create a new Delorean with the next_open naive date and
         # the correct timezone for the exchange.
-        open_delorean = Delorean(next_open, self.exchange_tz)
-        open_utc = open_delorean.shift(pytz.utc.zone).datetime
+        open_utc = self.exchange_dt_in_utc(next_open)
 
         market_open = open_utc
         market_close = market_open + self.get_trading_day_duration(open_utc)
@@ -253,7 +259,8 @@ Last successful date: %s" % self.market_open)
 
 class SimulationParameters(object):
     def __init__(self, period_start, period_end,
-                 capital_base=10e3):
+                 capital_base=10e3,
+                 emission_rate='daily'):
 
         global environment
         if not environment:
@@ -263,6 +270,8 @@ class SimulationParameters(object):
         self.period_start = period_start
         self.period_end = period_end
         self.capital_base = capital_base
+
+        self.emission_rate = emission_rate
 
         assert self.period_start <= self.period_end, \
             "Period start falls after period end."

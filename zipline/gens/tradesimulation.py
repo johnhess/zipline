@@ -82,15 +82,15 @@ class TradeSimulationClient(object):
     is sent to the algo.
     """
 
-    def __init__(self, algo, environment):
+    def __init__(self, algo, sim_params):
 
         self.algo = algo
-        self.environment = environment
+        self.sim_params = sim_params
 
         self.ordering_client = TransactionSimulator()
-        self.perf_tracker = PerformanceTracker(self.environment)
+        self.perf_tracker = PerformanceTracker(self.sim_params)
 
-        self.algo_start = self.environment.first_open
+        self.algo_start = self.sim_params.first_open
         self.algo_sim = AlgorithmSimulator(
             self.ordering_client,
             self.perf_tracker,
@@ -137,6 +137,11 @@ class TradeSimulationClient(object):
 
 class AlgorithmSimulator(object):
 
+    EMISSION_TO_PERF_KEY_MAP = {
+        'minute': 'intraday_perf',
+        'daily': 'daily_perf'
+    }
+
     def __init__(self,
                  order_book,
                  perf_tracker,
@@ -151,6 +156,9 @@ class AlgorithmSimulator(object):
         # the algo can place new orders.
         self.order_book = order_book
         self.perf_tracker = perf_tracker
+
+        self.perf_key = self.EMISSION_TO_PERF_KEY_MAP[
+            perf_tracker.emission_rate]
 
         self.algo = algo
         self.algo_start = algo_start.replace(hour=0, minute=0,
@@ -263,7 +271,7 @@ class AlgorithmSimulator(object):
                         for perf_message in event.perf_messages:
                             # append current values of recorded vars
                             # to emitted message
-                            perf_message['daily_perf']['recorded_vars'] =\
+                            perf_message[self.perf_key]['recorded_vars'] =\
                                 self.algo.recorded_vars
                             yield perf_message
                         del event['perf_messages']
@@ -278,7 +286,7 @@ class AlgorithmSimulator(object):
                 self.perf_tracker.handle_simulation_end()
 
             for message in perf_messages:
-                message['daily_perf']['recorded_vars'] =\
+                message[self.perf_key]['recorded_vars'] =\
                     self.algo.recorded_vars
                 yield message
 

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import numbers
 import unittest
 import datetime
 import pytz
@@ -44,30 +44,32 @@ class RiskCompareIterativeToBatch(unittest.TestCase):
         self.end_date = datetime.datetime(
             year=2006, month=12, day=31, tzinfo=pytz.utc)
 
-        self.oneday = datetime.timedelta(days=1)
-
     def test_risk_metrics_returns(self):
-        risk_metrics_refactor = risk.RiskMetricsIterative(self.start_date)
+        trading.environment = trading.TradingEnvironment()
+        # Advance start date to first date in the trading calendar
+        if trading.environment.is_trading_day(self.start_date):
+            start_date = self.start_date
+        else:
+            start_date = trading.environment.next_trading_day(self.start_date)
 
-        todays_date = self.start_date
+        risk_metrics_refactor = risk.RiskMetricsIterative(start_date)
+        todays_date = start_date
 
         cur_returns = []
         for i, ret in enumerate(RETURNS):
+
             todays_return_obj = DailyReturn(
                 todays_date,
                 ret
             )
-
             cur_returns.append(todays_return_obj)
 
             # Move forward day counter to next trading day
-            todays_date += self.oneday
-            while not trading.environment.is_trading_day(todays_date):
-                todays_date += self.oneday
+            todays_date = trading.environment.next_trading_day(todays_date)
 
             try:
                 risk_metrics_original = risk.RiskMetricsBatch(
-                    start_date=self.start_date,
+                    start_date=start_date,
                     end_date=todays_date,
                     returns=cur_returns
                 )
@@ -87,20 +89,18 @@ class RiskCompareIterativeToBatch(unittest.TestCase):
                 risk_metrics_original.end_date,
                 risk_metrics_refactor.end_date)
             self.assertEqual(
-                risk_metrics_original.treasury_duration,
-                risk_metrics_refactor.treasury_duration)
-            self.assertEqual(
-                risk_metrics_original.treasury_curve,
-                risk_metrics_refactor.treasury_curve)
-            self.assertEqual(
                 risk_metrics_original.treasury_period_return,
                 risk_metrics_refactor.treasury_period_return)
-            self.assertEqual(
+            np.testing.assert_allclose(
                 risk_metrics_original.benchmark_returns,
-                risk_metrics_refactor.benchmark_returns)
-            self.assertEqual(
+                risk_metrics_refactor.benchmark_returns,
+                rtol=0.001
+            )
+            np.testing.assert_allclose(
                 risk_metrics_original.algorithm_returns,
-                risk_metrics_refactor.algorithm_returns)
+                risk_metrics_refactor.algorithm_returns,
+                rtol=0.001
+            )
             risk_original_dict = risk_metrics_original.to_dict()
             risk_refactor_dict = risk_metrics_refactor.to_dict()
             self.assertEqual(set(risk_original_dict.keys()),
@@ -120,12 +120,24 @@ class RiskCompareIterativeToBatch(unittest.TestCase):
                             truth=risk_original_dict[measure],
                             returned=risk_refactor_dict[measure]))
                 else:
-                    np.testing.assert_equal(
-                        risk_original_dict[measure],
-                        risk_refactor_dict[measure],
-                        err_msg_format.format(
-                            iter=i,
-                            measure=measure,
-                            truth=risk_original_dict[measure],
-                            returned=risk_refactor_dict[measure])
-                    )
+                    if isinstance(risk_original_dict[measure], numbers.Real):
+                        np.testing.assert_allclose(
+                            risk_original_dict[measure],
+                            risk_refactor_dict[measure],
+                            rtol=0.001,
+                            err_msg=err_msg_format.format(
+                                iter=i,
+                                measure=measure,
+                                truth=risk_original_dict[measure],
+                                returned=risk_refactor_dict[measure])
+                        )
+                    else:
+                        np.testing.assert_equal(
+                            risk_original_dict[measure],
+                            risk_refactor_dict[measure],
+                            err_msg=err_msg_format.format(
+                                iter=i,
+                                measure=measure,
+                                truth=risk_original_dict[measure],
+                                returned=risk_refactor_dict[measure])
+                        )

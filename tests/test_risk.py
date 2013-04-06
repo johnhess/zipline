@@ -1,5 +1,5 @@
 #
-# Copyright 2012 Quantopian, Inc.
+# Copyright 2013 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ from zipline.utils import factory
 from zipline.finance.trading import SimulationParameters
 
 
-class Risk(unittest.TestCase):
+class TestRisk(unittest.TestCase):
 
     def setUp(self):
 
@@ -41,11 +41,6 @@ class Risk(unittest.TestCase):
             period_start=start_date,
             period_end=end_date
         )
-
-        self.onesec = datetime.timedelta(seconds=1)
-        self.oneday = datetime.timedelta(days=1)
-        self.tradingday = datetime.timedelta(hours=6, minutes=30)
-        self.dt = datetime.datetime.utcnow()
 
         self.algo_returns_06 = factory.create_returns_from_list(
             RETURNS,
@@ -728,8 +723,10 @@ class Risk(unittest.TestCase):
                          [0.0500])
 
     def test_benchmarkrange(self):
-        self.check_year_range(datetime.datetime(year=2008, month=1, day=1),
-                              2)
+        self.check_year_range(
+            datetime.datetime(
+                year=2008, month=1, day=1, tzinfo=pytz.utc),
+            2)
 
     def test_partial_month(self):
 
@@ -749,21 +746,18 @@ class Risk(unittest.TestCase):
             period_end=end
         )
 
-        returns = factory.create_returns(total_days, sim_params90s)
+        returns = factory.create_returns_from_range(sim_params90s)
         returns = returns[:-10]  # truncate the returns series to end mid-month
         metrics = risk.RiskReport(returns, sim_params90s)
         total_months = 60
         self.check_metrics(metrics, total_months, start)
 
     def check_year_range(self, start_date, years):
-        if(start_date.month <= 2):
-            ld = calendar.leapdays(start_date.year, start_date.year + years)
-        else:
-            # because we may catch the leap of the last year,
-            # and i think this func is [start,end)
-            ld = calendar.leapdays(start_date.year,
-                                   start_date.year + years + 1)
-        returns = factory.create_returns(365 * years + ld, self.sim_params08)
+        sim_params = SimulationParameters(
+            period_start=start_date,
+            period_end=start_date.replace(year=(start_date.year + years))
+        )
+        returns = factory.create_returns_from_range(sim_params)
         metrics = risk.RiskReport(returns, self.sim_params)
         total_months = years * 12
         self.check_metrics(metrics, total_months, start_date)
