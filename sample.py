@@ -38,4 +38,3 @@ class DualMovingAverage(TradingAlgorithm):
 data = load_from_yahoo()
 dma = DualMovingAverage()
 results = dma.run(data)
-
