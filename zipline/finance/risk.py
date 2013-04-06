@@ -58,15 +58,14 @@ Risk Report
 import logbook
 import datetime
 import math
-import itertools
-from collections import OrderedDict
-import bisect
 import numpy as np
 import numpy.linalg as la
+from dateutil.relativedelta import relativedelta
 
 import zipline.finance.trading as trading
 from zipline.utils.date_utils import epoch_now
 
+import pandas as pd
 
 log = logbook.Logger('Risk')
 
@@ -78,28 +77,215 @@ TREASURY_DURATIONS = [
 ]
 
 
-def advance_by_months(dt, jump_in_months):
-    month = dt.month + jump_in_months
-    years = month / 12
-    month = month % 12
+############################
+# Risk Metric Calculations #
+############################
 
-    # no remainder means that we are landing in december.
-    # modulo is, in a way, a zero indexed circular array.
-    # this is a way of converting to 1 indexed months.
-    # (in our modulo index, december is zeroth)
-    if(month == 0):
-        month = 12
-        years = years - 1
 
-    return dt.replace(year=dt.year + years, month=month)
+def sharpe_ratio(algorithm_volatility, algorithm_return, treasury_return):
+    """
+    http://en.wikipedia.org/wiki/Sharpe_ratio
+
+    Args:
+        algorithm_volatility (float): Algorithm volatility.
+        algorithm_return (float): Algorithm return percentage.
+        treasury_return (float): Treasury return percentage.
+
+    Returns:
+        float. The Sharpe ratio.
+    """
+    if np.allclose(algorithm_volatility, 0):
+        return 0.0
+
+    return (algorithm_return - treasury_return) / algorithm_volatility
+
+
+def sortino_ratio(algorithm_returns, algorithm_period_return, mar):
+    """
+    http://en.wikipedia.org/wiki/Sortino_ratio
+
+    Args:
+        algorithm_returns (np.array-like):
+            Returns from algorithm lifetime.
+        algorithm_period_return (float):
+            Algorithm return percentage from latest period.
+        mar (float): Minimum acceptable return.
+
+    Returns:
+        float. The Sortino ratio.
+    """
+    if len(algorithm_returns) == 0:
+        return 0.0
+
+    rets = algorithm_returns
+    downside = (rets[rets < mar] - mar) ** 2
+    dr = np.sqrt(downside.sum() / len(rets))
+
+    if np.allclose(dr, 0):
+        return 0.0
+
+    return (algorithm_period_return - mar) / dr
+
+
+def information_ratio(algorithm_returns, benchmark_returns):
+    """
+    http://en.wikipedia.org/wiki/Information_ratio
+
+    Args:
+        algorithm_returns (np.array-like):
+            All returns during algorithm lifetime.
+        benchmark_returns (np.array-like):
+            All benchmark returns during algo lifetime.
+
+    Returns:
+        float. Information ratio.
+    """
+    relative_returns = algorithm_returns - benchmark_returns
+
+    relative_deviation = relative_returns.std(ddof=1)
+
+    if np.allclose(relative_deviation, 0) or np.isnan(relative_deviation):
+        return 0.0
+
+    return np.mean(relative_returns) / relative_deviation
+
+
+def alpha(algorithm_period_return, treasury_period_return,
+          benchmark_period_returns, beta):
+    """
+    http://en.wikipedia.org/wiki/Alpha_(investment)
+
+    Args:
+        algorithm_period_return (float):
+            Return percentage from algorithm period.
+        treasury_period_return (float):
+            Return percentage for treasury period.
+        benchmark_period_return (float):
+            Return percentage for benchmark period.
+        beta (float):
+            beta value for the same period as all other values
+
+    Returns:
+        float. The alpha of the algorithm.
+    """
+    return algorithm_period_return - \
+        (treasury_period_return + beta *
+         (benchmark_period_returns - treasury_period_return))
+
+###########################
+# End Risk Metric Section #
+###########################
+
+
+def get_treasury_rate(treasury_curves, treasury_duration, day):
+    rate = None
+
+    curve = treasury_curves[day]
+    # 1month note data begins in 8/2001,
+    # so we can use 3month instead.
+    idx = TREASURY_DURATIONS.index(treasury_duration)
+    for duration in TREASURY_DURATIONS[idx:]:
+        rate = curve[duration]
+        if rate is not None:
+            break
+
+    return rate
+
+
+def search_day_distance(end_date, dt):
+    tdd = trading.environment.trading_day_distance(dt, end_date)
+    if tdd is None:
+        return None
+    assert tdd >= 0
+    return tdd
+
+
+def select_treasury_duration(start_date, end_date):
+    td = end_date - start_date
+    if td.days <= 31:
+        treasury_duration = '1month'
+    elif td.days <= 93:
+        treasury_duration = '3month'
+    elif td.days <= 186:
+        treasury_duration = '6month'
+    elif td.days <= 366:
+        treasury_duration = '1year'
+    elif td.days <= 365 * 2 + 1:
+        treasury_duration = '2year'
+    elif td.days <= 365 * 3 + 1:
+        treasury_duration = '3year'
+    elif td.days <= 365 * 5 + 2:
+        treasury_duration = '5year'
+    elif td.days <= 365 * 7 + 2:
+        treasury_duration = '7year'
+    elif td.days <= 365 * 10 + 2:
+        treasury_duration = '10year'
+    else:
+        treasury_duration = '30year'
+
+    return treasury_duration
+
+
+def choose_treasury(treasury_curves, start_date, end_date):
+    treasury_duration = select_treasury_duration(start_date, end_date)
+    end_day = end_date.replace(hour=0, minute=0, second=0)
+    search_day = None
+
+    if end_day in treasury_curves:
+        rate = get_treasury_rate(treasury_curves,
+                                 treasury_duration,
+                                 end_day)
+        if rate is not None:
+            search_day = end_day
+
+    if not search_day:
+        # in case end date is not a trading day or there is no treasury
+        # data, search for the previous day with an interest rate.
+        search_days = treasury_curves.index
+
+        # Find rightmost value less than or equal to end_day
+        i = search_days.searchsorted(end_day)
+        for prev_day in search_days[i - 1::-1]:
+            rate = get_treasury_rate(treasury_curves,
+                                     treasury_duration,
+                                     prev_day)
+            if rate is not None:
+                search_day = prev_day
+                search_dist = search_day_distance(end_date, prev_day)
+                break
+
+        if search_day:
+            if (search_dist is None or search_dist > 1) and \
+                    search_days[0] <= end_day <= search_days[-1]:
+                message = "No rate within 1 trading day of end date = \
+{dt} and term = {term}. Using {search_day}. Check that date doesn't exceed \
+treasury history range."
+                message = message.format(dt=end_date,
+                                         term=treasury_duration,
+                                         search_day=search_day)
+                log.warn(message)
+
+    if search_day:
+        td = end_date - start_date
+        return rate * (td.days + 1) / 365
+
+    message = "No rate for end date = {dt} and term = {term}. Check \
+that date doesn't exceed treasury history range."
+    message = message.format(
+        dt=end_date,
+        term=treasury_duration
+    )
+    raise Exception(message)
 
 
 class RiskMetricsBase(object):
     def __init__(self, start_date, end_date, returns):
 
-        self.treasury_curves = trading.environment.treasury_curves
-        assert isinstance(self.treasury_curves, OrderedDict), \
-            "Treasury curves must be an OrderedDict"
+        treasury_curves = trading.environment.treasury_curves
+        mask = ((treasury_curves.index >= start_date) &
+                (treasury_curves.index <= end_date))
+
+        self.treasury_curves = treasury_curves[mask]
 
         self.start_date = start_date
         self.end_date = end_date
@@ -130,7 +316,11 @@ class RiskMetricsBase(object):
             self.benchmark_returns)
         self.algorithm_volatility = self.calculate_volatility(
             self.algorithm_returns)
-        self.treasury_period_return = self.choose_treasury()
+        self.treasury_period_return = choose_treasury(
+            self.treasury_curves,
+            self.start_date,
+            self.end_date
+        )
         self.sharpe = self.calculate_sharpe()
         self.sortino = self.calculate_sortino()
         self.information = self.calculate_information()
@@ -205,21 +395,18 @@ class RiskMetricsBase(object):
         return '\n'.join(statements)
 
     def calculate_period_returns(self, daily_returns):
+        returns = pd.Series([x.returns for x in daily_returns],
+                            index=[x.date for x in daily_returns])
 
-        #TODO: replace this with pandas.
-        returns = [
-            x.returns for x in daily_returns
-            if x.date >= self.start_date and
-            x.date <= self.end_date and
-            trading.environment.is_trading_day(x.date)
-        ]
+        trade_days = trading.environment.trading_days
+        trade_day_mask = returns.index.normalize().isin(trade_days)
 
-        period_returns = 1.0
+        mask = ((returns.index >= self.start_date) &
+                (returns.index <= self.end_date) & trade_day_mask)
 
-        for r in returns:
-            period_returns = period_returns * (1.0 + r)
+        returns = returns[mask]
+        period_returns = (1. + returns).prod() - 1
 
-        period_returns = period_returns - 1.0
         return period_returns, returns
 
     def calculate_volatility(self, daily_returns):
@@ -229,49 +416,27 @@ class RiskMetricsBase(object):
         """
         http://en.wikipedia.org/wiki/Sharpe_ratio
         """
-        if self.algorithm_volatility == 0:
-            return 0.0
-
-        return ((self.algorithm_period_returns - self.treasury_period_return) /
-                self.algorithm_volatility)
+        return sharpe_ratio(self.algorithm_volatility,
+                            self.algorithm_period_returns,
+                            self.treasury_period_return)
 
     def calculate_sortino(self, mar=None):
         """
         http://en.wikipedia.org/wiki/Sortino_ratio
         """
-        if len(self.algorithm_returns) == 0:
-            return 0.0
-
         if mar is None:
             mar = self.treasury_period_return
 
-        downside = [
-            (x - mar)**2
-            for x in self.algorithm_returns
-            if x < mar]
-        dr = float(math.sqrt(sum(downside) / len(self.algorithm_returns)))
-
-        if dr < 0.000001:
-            return 0.0
-
-        return ((self.algorithm_period_returns - mar) / dr)
+        return sortino_ratio(self.algorithm_returns,
+                             self.algorithm_period_returns,
+                             mar)
 
     def calculate_information(self):
         """
         http://en.wikipedia.org/wiki/Information_ratio
         """
-
-        relative_returns = [
-            r - b
-            for r, b
-            in itertools.izip(self.algorithm_returns, self.benchmark_returns)]
-
-        relative_deviation = np.std(relative_returns, ddof=1)
-
-        if relative_deviation < 0.000001 or np.isnan(relative_deviation):
-            return 0.0
-
-        return np.mean(relative_returns) / relative_deviation
+        return information_ratio(self.algorithm_returns,
+                                 self.benchmark_returns)
 
     def calculate_beta(self):
         """
@@ -309,9 +474,10 @@ class RiskMetricsBase(object):
         """
         http://en.wikipedia.org/wiki/Alpha_(investment)
         """
-        return self.algorithm_period_returns - \
-            (self.treasury_period_return + self.beta *
-             (self.benchmark_period_returns - self.treasury_period_return))
+        return alpha(self.algorithm_period_returns,
+                     self.treasury_period_return,
+                     self.benchmark_period_returns,
+                     self.beta)
 
     def calculate_max_drawdown(self):
         compounded_returns = []
@@ -341,95 +507,6 @@ class RiskMetricsBase(object):
             return 0.0
 
         return 1.0 - math.exp(max_drawdown)
-
-    def choose_treasury(self):
-        td = self.end_date - self.start_date
-        if td.days <= 31:
-            self.treasury_duration = '1month'
-        elif td.days <= 93:
-            self.treasury_duration = '3month'
-        elif td.days <= 186:
-            self.treasury_duration = '6month'
-        elif td.days <= 366:
-            self.treasury_duration = '1year'
-        elif td.days <= 365 * 2 + 1:
-            self.treasury_duration = '2year'
-        elif td.days <= 365 * 3 + 1:
-            self.treasury_duration = '3year'
-        elif td.days <= 365 * 5 + 2:
-            self.treasury_duration = '5year'
-        elif td.days <= 365 * 7 + 2:
-            self.treasury_duration = '7year'
-        elif td.days <= 365 * 10 + 2:
-            self.treasury_duration = '10year'
-        else:
-            self.treasury_duration = '30year'
-
-        end_day = self.end_date.replace(hour=0, minute=0, second=0)
-        search_day = None
-
-        if end_day in self.treasury_curves:
-            rate = self.get_treasury_rate(end_day)
-            if rate is not None:
-                search_day = end_day
-
-        if not search_day:
-            # in case end date is not a trading day or there is no treasury
-            # data, search for the previous day with an interest rate.
-            search_days = self.treasury_curves.keys()
-
-            # Find rightmost value less than or equal to end_day
-            i = bisect.bisect_right(search_days, end_day)
-            for prev_day in search_days[i - 1::-1]:
-                rate = self.get_treasury_rate(prev_day)
-                if rate is not None:
-                    search_day = prev_day
-                    search_dist = self.search_day_distance(prev_day)
-                    break
-
-            if search_day:
-                if (search_dist is None or search_dist > 1) and \
-                        search_days[0] <= end_day <= search_days[-1]:
-                    message = "No rate within 1 trading day of end date = \
-{dt} and term = {term}. Using {search_day}. Check that date doesn't exceed \
-treasury history range."
-                    message = message.format(dt=self.end_date,
-                                             term=self.treasury_duration,
-                                             search_day=search_day)
-                    log.warn(message)
-
-        if search_day:
-            self.treasury_curve = self.treasury_curves[search_day]
-            return rate * (td.days + 1) / 365
-
-        message = "No rate for end date = {dt} and term = {term}. Check \
-that date doesn't exceed treasury history range."
-        message = message.format(
-            dt=self.end_date,
-            term=self.treasury_duration
-        )
-        raise Exception(message)
-
-    def search_day_distance(self, dt):
-        tdd = trading.environment.trading_day_distance(dt, self.end_date)
-        if tdd is None:
-            return None
-        assert tdd >= 0
-        return tdd
-
-    def get_treasury_rate(self, day):
-        rate = None
-
-        curve = self.treasury_curves[day]
-        # 1month note data begins in 8/2001,
-        # so we can use 3month instead.
-        idx = TREASURY_DURATIONS.index(self.treasury_duration)
-        for duration in TREASURY_DURATIONS[idx:]:
-            rate = curve[duration]
-            if rate is not None:
-                break
-
-        return rate
 
 
 class RiskMetricsIterative(RiskMetricsBase):
@@ -502,7 +579,11 @@ algorithm_returns ({algo_count}) in range {start} : {end}"
             self.calculate_volatility(self.benchmark_returns))
         self.algorithm_volatility.append(
             self.calculate_volatility(self.algorithm_returns))
-        self.treasury_period_return = self.choose_treasury()
+        self.treasury_period_return = choose_treasury(
+            self.treasury_curves,
+            self.start_date,
+            self.end_date
+        )
         self.excess_returns.append(
             self.algorithm_period_returns[-1] - self.treasury_period_return)
         self.beta.append(self.calculate_beta()[0])
@@ -600,13 +681,8 @@ algorithm_returns ({algo_count}) in range {start} : {end}"
             )
 
     def calculate_period_returns(self, returns):
-        period_returns = 1.0
-
-        for r in returns:
-            period_returns *= (1.0 + r)
-
-        period_returns -= 1.0
-        return period_returns
+        returns = np.array(returns)
+        return (1. + returns).prod() - 1
 
     def update_current_max(self):
         if len(self.compounded_log_returns) == 0:
@@ -631,59 +707,37 @@ algorithm_returns ({algo_count}) in range {start} : {end}"
         """
         http://en.wikipedia.org/wiki/Sharpe_ratio
         """
-        if self.algorithm_volatility[-1] == 0:
-            return 0.0
-
-        return (self.algorithm_period_returns[-1] -
-                self.treasury_period_return) / self.algorithm_volatility[-1]
+        return sharpe_ratio(self.algorithm_volatility[-1],
+                            self.algorithm_period_returns[-1],
+                            self.treasury_period_return)
 
     def calculate_sortino(self, mar=None):
         """
         http://en.wikipedia.org/wiki/Sortino_ratio
         """
-        if len(self.algorithm_returns) == 0:
-            return 0.0
-
         if mar is None:
             mar = self.treasury_period_return
 
-        downside = [
-            (x - mar)**2
-            for x in self.algorithm_returns
-            if x < mar]
-        dr = float(math.sqrt(sum(downside) / len(self.algorithm_returns)))
-
-        if dr < 0.000001:
-            return 0.0
-
-        return ((self.algorithm_period_returns[-1] - mar) /
-                dr)
+        return sortino_ratio(np.array(self.algorithm_returns),
+                             self.algorithm_period_returns[-1],
+                             mar)
 
     def calculate_information(self):
         """
         http://en.wikipedia.org/wiki/Information_ratio
         """
-
-        relative_returns = [
-            r - b
-            for r, b
-            in itertools.izip(self.algorithm_returns, self.benchmark_returns)]
-
-        relative_deviation = np.std(relative_returns, ddof=1)
-
-        if relative_deviation < 0.000001 or np.isnan(relative_deviation):
-            return 0.0
-
-        return np.mean(relative_returns) / relative_deviation
+        A = np.array
+        return information_ratio(A(self.algorithm_returns),
+                                 A(self.benchmark_returns))
 
     def calculate_alpha(self):
         """
         http://en.wikipedia.org/wiki/Alpha_(investment)
         """
-        return (self.algorithm_period_returns[-1] -
-                (self.treasury_period_return + self.beta[-1] *
-                 (self.benchmark_period_returns[-1] -
-                  self.treasury_period_return)))
+        return alpha(self.algorithm_period_returns[-1],
+                     self.treasury_period_return,
+                     self.benchmark_period_returns[-1],
+                     self.beta[-1])
 
 
 class RiskMetricsBatch(RiskMetricsBase):
@@ -691,11 +745,7 @@ class RiskMetricsBatch(RiskMetricsBase):
 
 
 class RiskReport(object):
-    def __init__(
-        self,
-        algorithm_returns,
-        sim_params
-    ):
+    def __init__(self, algorithm_returns, sim_params):
         """
         algorithm_returns needs to be a list of daily_return objects
         sorted in date ascending order
@@ -713,8 +763,8 @@ class RiskReport(object):
             end_date = self.algorithm_returns[-1].date
 
         self.month_periods = self.periods_in_range(1, start_date, end_date)
-        self.three_month_periods = self.periods_in_range(
-            3, start_date, end_date)
+        self.three_month_periods = self.periods_in_range(3, start_date,
+                                                         end_date)
         self.six_month_periods = self.periods_in_range(6, start_date, end_date)
         self.year_periods = self.periods_in_range(12, start_date, end_date)
 
@@ -753,9 +803,9 @@ class RiskReport(object):
 
         #ensure that we have an end at the end of a calendar month, in case
         #the return series ends mid-month...
-        the_end = advance_by_months(end.replace(day=1), 1) - one_day
+        the_end = end.replace(day=1) + relativedelta(months=1) - one_day
         while True:
-            cur_end = advance_by_months(cur_start, months_per) - one_day
+            cur_end = cur_start + relativedelta(months=months_per) - one_day
             if(cur_end > the_end):
                 break
             cur_period_metrics = RiskMetricsBatch(
@@ -765,13 +815,6 @@ class RiskReport(object):
             )
 
             ends.append(cur_period_metrics)
-            cur_start = advance_by_months(cur_start, 1)
+            cur_start = cur_start + relativedelta(months=1)
 
         return ends
-
-    def find_metric_by_end(self, end_date, duration, metric):
-        col = getattr(self, duration + "_periods")
-        col = [getattr(x, metric) for x in col if x.end_date == end_date]
-        if len(col) == 1:
-            return col[0]
-        return None

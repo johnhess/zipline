@@ -1,5 +1,5 @@
 #
-# Copyright 2012 Quantopian, Inc.
+# Copyright 2013 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ from operator import attrgetter
 
 import zipline.utils.factory as factory
 import zipline.finance.performance as perf
-from zipline.utils.protocol_utils import ndict
+from zipline.finance.slippage import Transaction
 
 from zipline.gens.composites import date_sorted_sources
 from zipline.finance.trading import SimulationParameters
@@ -1018,7 +1018,7 @@ class TestPerformanceTracker(unittest.TestCase):
         #create a transaction for all but
         #first trade in each sid, to simulate None transaction
         if event.dt != no_txn_dt:
-            txn = ndict({
+            txn = Transaction(**{
                 'sid': event.sid,
                 'amount': -25,
                 'dt': event.dt,
@@ -1030,3 +1030,48 @@ class TestPerformanceTracker(unittest.TestCase):
         event['TRANSACTION'] = txn
 
         return event
+
+    def test_minute_tracker(self):
+        """ Tests minute performance tracking."""
+        start_dt = trading.environment.exchange_dt_in_utc(
+            datetime.datetime(2013, 3, 1, 9, 30))
+        end_dt = trading.environment.exchange_dt_in_utc(
+            datetime.datetime(2013, 3, 1, 16, 0))
+
+        sim_params = SimulationParameters(
+            period_start=start_dt,
+            period_end=end_dt,
+            emission_rate='minute'
+        )
+        tracker = perf.PerformanceTracker(sim_params)
+
+        foo_event_1 = factory.create_trade('foo', 10.0, 20, start_dt)
+        bar_event_1 = factory.create_trade('bar', 100.0, 200, start_dt)
+        txn = Transaction(sid=foo_event_1.sid,
+                          amount=-25,
+                          dt=foo_event_1.dt,
+                          price=10.0,
+                          commission=0.50)
+        foo_event_1.TRANSACTION = txn
+
+        foo_event_2 = factory.create_trade(
+            'foo', 11.0, 20, start_dt + datetime.timedelta(minutes=1))
+        bar_event_2 = factory.create_trade(
+            'bar', 11.0, 20, start_dt + datetime.timedelta(minutes=1))
+
+        foo_event_3 = factory.create_trade(
+            'foo', 12.0, 30, start_dt + datetime.timedelta(minutes=2))
+
+        tracker.process_event(foo_event_1)
+        tracker.process_event(bar_event_1)
+        messages = tracker.process_event(foo_event_2)
+        tracker.process_event(bar_event_2)
+        messages += tracker.process_event(foo_event_3)
+
+        self.assertEquals(2, len(messages))
+
+        self.assertEquals(1, len(messages[0]['intraday_perf']['transactions']),
+                          "The first message should contain one transaction.")
+        # Check that transactions aren't emitted for previous events.
+        self.assertEquals(0, len(messages[1]['intraday_perf']['transactions']),
+                          "The second message should have no transactions.")
